@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: 123
+      POSTGRES_DB: tickets
+    ports: ["5432:5432"]
+  api-gateway:
+    build: ./api-gateway
+    ports: ["3000:3000"]
+    depends_on: [event-service,ticket-service]
+  event-service:
+    build: ./event-service
+    environment:
+      DATABASE_URL: postgres://user:123@postgres:5432/tickets
+    depends_on: [postgres]
+  ticket-service:
+    build: ./ticket-service
+    environment:
+      DATABASE_URL: postgres://user:123@postgres:5432/tickets
+    depends_on: [postgres]
