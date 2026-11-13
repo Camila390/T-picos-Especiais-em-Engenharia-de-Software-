@@ -21,7 +21,6 @@ async function init() {
     )
   `);
 
-  // Atualiza ingressos antigos sem status
   await pool.query(`
     ALTER TABLE tickets
     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ativo'
@@ -31,21 +30,36 @@ async function init() {
     UPDATE tickets SET status = 'ativo'
     WHERE status IS NULL
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_history (
+      id SERIAL PRIMARY KEY,
+      ticket_id INT NOT NULL,
+      action TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 }
 
-init().then(() => console.log('ticket-service OK com Postgres'));
+init()
+  .then(() => console.log('ticket-service OK com Postgres'))
+  .catch(error => console.error('Erro ao iniciar:', error));
 
+// Consultar todos os ingressos
 app.get('/', async (_, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM tickets');
     res.json(rows);
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Erro ao consultar ingressos' });
   }
 });
 
-// Comprar ingresso
+// Comprar ingresso e registrar histórico
 app.post('/buy', async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { eventId, user } = req.body;
 
@@ -55,19 +69,32 @@ app.post('/buy', async (req, res) => {
       });
     }
 
-    const { rows } = await pool.query(
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
       `INSERT INTO tickets (eventid, "user", status)
        VALUES ($1, $2, 'ativo') RETURNING *`,
       [eventId, user]
     );
 
+    await client.query(
+      `INSERT INTO ticket_history (ticket_id, action)
+       VALUES ($1, 'compra')`,
+      [rows[0].id]
+    );
+
+    await client.query('COMMIT');
+
     res.status(201).json({
-      msg: 'Ingresso salvo no Postgres!',
+      msg: 'Ingresso comprado e histórico registrado!',
       ticket: rows[0]
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Erro ao comprar ingresso' });
+  } finally {
+    client.release();
   }
 });
 
@@ -86,10 +113,14 @@ app.get('/user/:name', async (req, res) => {
   }
 });
 
-// Cancelar ingresso pelo ID
+// Cancelar ingresso e registrar histórico
 app.patch('/cancel/:id', async (req, res) => {
+  const client = await pool.connect();
+
   try {
-    const { rows } = await pool.query(
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
       `UPDATE tickets
        SET status = 'cancelado'
        WHERE id = $1 AND status = 'ativo'
@@ -98,6 +129,8 @@ app.patch('/cancel/:id', async (req, res) => {
     );
 
     if (rows.length === 0) {
+      await client.query('ROLLBACK');
+
       const ticket = await pool.query(
         'SELECT * FROM tickets WHERE id = $1',
         [req.params.id]
@@ -114,14 +147,52 @@ app.patch('/cancel/:id', async (req, res) => {
       });
     }
 
+    await client.query(
+      `INSERT INTO ticket_history (ticket_id, action)
+       VALUES ($1, 'cancelamento')`,
+      [rows[0].id]
+    );
+
+    await client.query('COMMIT');
+
     res.json({
-      msg: 'Ingresso cancelado com sucesso!',
+      msg: 'Ingresso cancelado e histórico registrado!',
       ticket: rows[0]
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Erro ao cancelar ingresso' });
+  } finally {
+    client.release();
   }
 });
 
-app.listen(3002, () => console.log('Ticket Service na porta 3002'));
+// Consultar histórico de um ingresso
+app.get('/history/:ticketId', async (req, res) => {
+  try {
+    const ticketId = Number(req.params.ticketId);
+
+    if (!Number.isInteger(ticketId) || ticketId <= 0) {
+      return res.status(400).json({
+        error: 'ID de ingresso inválido'
+      });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM ticket_history
+       WHERE ticket_id = $1
+       ORDER BY created_at DESC`,
+      [ticketId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao consultar histórico' });
+  }
+});
+
+app.listen(3002, () => {
+  console.log('Ticket Service na porta 3002');
+});
