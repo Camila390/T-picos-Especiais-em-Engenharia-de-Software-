@@ -1,6 +1,8 @@
 
 const express = require('express');
 const { Pool } = require('pg');
+const QRCode = require('qrcode');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -24,6 +26,16 @@ async function init() {
   await pool.query(`
     ALTER TABLE tickets
     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ativo'
+  `);
+
+  await pool.query(`
+    ALTER TABLE tickets
+    ADD COLUMN IF NOT EXISTS qr_token TEXT UNIQUE
+  `);
+
+  await pool.query(`
+    ALTER TABLE tickets
+    ADD COLUMN IF NOT EXISTS used_at TIMESTAMP
   `);
 
   await pool.query(`
@@ -56,7 +68,7 @@ app.get('/', async (_, res) => {
   }
 });
 
-// Comprar ingresso e registrar histórico
+// Comprar ingresso e gerar QR Code
 app.post('/buy', async (req, res) => {
   const client = await pool.connect();
 
@@ -69,12 +81,16 @@ app.post('/buy', async (req, res) => {
       });
     }
 
+    const qrToken = crypto.randomUUID();
+    const qrImage = await QRCode.toDataURL(qrToken);
+
     await client.query('BEGIN');
 
     const { rows } = await client.query(
-      `INSERT INTO tickets (eventid, "user", status)
-       VALUES ($1, $2, 'ativo') RETURNING *`,
-      [eventId, user]
+      `INSERT INTO tickets (eventid, "user", status, qr_token)
+       VALUES ($1, $2, 'ativo', $3)
+       RETURNING *`,
+      [eventId, user, qrToken]
     );
 
     await client.query(
@@ -86,8 +102,9 @@ app.post('/buy', async (req, res) => {
     await client.query('COMMIT');
 
     res.status(201).json({
-      msg: 'Ingresso comprado e histórico registrado!',
-      ticket: rows[0]
+      msg: 'Ingresso comprado e QR Code gerado!',
+      ticket: rows[0],
+      qrCode: qrImage
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -113,7 +130,7 @@ app.get('/user/:name', async (req, res) => {
   }
 });
 
-// Cancelar ingresso e registrar histórico
+// Cancelar ingresso
 app.patch('/cancel/:id', async (req, res) => {
   const client = await pool.connect();
 
@@ -123,7 +140,9 @@ app.patch('/cancel/:id', async (req, res) => {
     const { rows } = await client.query(
       `UPDATE tickets
        SET status = 'cancelado'
-       WHERE id = $1 AND status = 'ativo'
+       WHERE id = $1
+       AND status = 'ativo'
+       AND used_at IS NULL
        RETURNING *`,
       [req.params.id]
     );
@@ -142,6 +161,12 @@ app.patch('/cancel/:id', async (req, res) => {
         });
       }
 
+      if (ticket.rows[0].used_at !== null) {
+        return res.status(409).json({
+          error: 'Ingresso já foi utilizado'
+        });
+      }
+
       return res.status(409).json({
         error: 'Ingresso já está cancelado'
       });
@@ -156,7 +181,7 @@ app.patch('/cancel/:id', async (req, res) => {
     await client.query('COMMIT');
 
     res.json({
-      msg: 'Ingresso cancelado e histórico registrado!',
+      msg: 'Ingresso cancelado com sucesso!',
       ticket: rows[0]
     });
   } catch (error) {
@@ -168,7 +193,78 @@ app.patch('/cancel/:id', async (req, res) => {
   }
 });
 
-// Consultar histórico de um ingresso
+// Validar ingresso pelo QR Code
+app.post('/validate', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { code } = req.body;
+
+    if (!code) {
+      return res.status(400).json({
+        error: 'Informe o código do QR Code'
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      `UPDATE tickets
+       SET used_at = CURRENT_TIMESTAMP
+       WHERE qr_token = $1
+       AND status = 'ativo'
+       AND used_at IS NULL
+       RETURNING id, eventid, "user", status, used_at`,
+      [code]
+    );
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      const ticket = await pool.query(
+        'SELECT * FROM tickets WHERE qr_token = $1',
+        [code]
+      );
+
+      if (ticket.rows.length === 0) {
+        return res.status(404).json({
+          error: 'QR Code inválido'
+        });
+      }
+
+      if (ticket.rows[0].status === 'cancelado') {
+        return res.status(409).json({
+          error: 'Ingresso cancelado. Entrada não permitida.'
+        });
+      }
+
+      return res.status(409).json({
+        error: 'Ingresso já foi utilizado anteriormente.'
+      });
+    }
+
+    await client.query(
+      `INSERT INTO ticket_history (ticket_id, action)
+       VALUES ($1, 'validacao')`,
+      [rows[0].id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      msg: 'Ingresso validado! Entrada autorizada.',
+      ticket: rows[0]
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao validar ingresso' });
+  } finally {
+    client.release();
+  }
+});
+
+// Consultar histórico
 app.get('/history/:ticketId', async (req, res) => {
   try {
     const ticketId = Number(req.params.ticketId);

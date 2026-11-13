@@ -42,5 +42,12 @@ app.get('/tickets/:id/history', (req, res) =>
     .catch(error => res.status(error.response?.status || 502)
       .json(error.response?.data || { error: 'Erro ao consultar histórico' }))
 );
+// Validar ingresso pelo QR Code
+app.post('/tickets/validate', (req, res) =>
+  axios.post('http://ticket-service:3002/validate', req.body)
+    .then(r => res.json(r.data))
+    .catch(error => res.status(error.response?.status || 502)
+      .json(error.response?.data || { error: 'Erro ao validar ingresso' }))
+);
 
 app.listen(3000, () => console.log('API Gateway OK na 3000'));
